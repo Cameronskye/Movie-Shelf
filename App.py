@@ -7,14 +7,29 @@ import requests
 import streamlit as st
 
 APP_TITLE = "Movie Shelf"
-DB_PATH = "movies.db"
-POSTERS_DIR = "posters"
+import uuid
+import os
+import streamlit as st
+from streamlit_local_storage import LocalStorage
 
-# Optional: set your OMDb API key via environment variable OMDB_API_KEY
-# Windows PowerShell:
-#   setx OMDB_API_KEY "YOURKEY"
-# Then reopen terminal.
-OMDB_API_KEY = os.getenv("OMDB_API_KEY", "").strip()
+# --- Secrets / env (works locally + Streamlit Cloud) ---
+OMDB_API_KEY = (st.secrets.get("OMDB_API_KEY", "") or os.getenv("OMDB_API_KEY", "")).strip()
+
+# --- Anonymous per-browser user ID ---
+localS = LocalStorage()
+user_id = localS.getItem("movie_shelf_user_id")
+if not user_id:
+    user_id = str(uuid.uuid4())
+    localS.setItem("movie_shelf_user_id", user_id)
+
+# --- Force data to be stored per user ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USER_DIR = os.path.join(BASE_DIR, "data", "users", user_id)
+os.makedirs(USER_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(USER_DIR, "movies.db")
+POSTERS_DIR = os.path.join(USER_DIR, "posters")
+
 
 
 # ---------------------------
@@ -313,6 +328,60 @@ def move_item(list_id: int, movie_id: int, direction: str):
 
 
 # ---------------------------
+import io
+import zipfile
+import shutil
+from pathlib import Path
+
+def make_backup_zip_bytes() -> bytes:
+    """Zip up the current user's movies.db + posters/ folder."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        db_file = Path(DB_PATH)
+        posters_dir = Path(POSTERS_DIR)
+
+        if db_file.exists():
+            z.write(db_file, arcname="movies.db")
+
+        if posters_dir.exists():
+            for p in posters_dir.rglob("*"):
+                if p.is_file():
+                    z.write(p, arcname=str(Path("posters") / p.relative_to(posters_dir)))
+
+    return buf.getvalue()
+
+def restore_from_backup_zip(uploaded_bytes: bytes):
+    """Restore movies.db + posters/ from a zip uploaded by the user."""
+    # Close any open DB connections by creating a fresh db() per call (your code already does).
+    tmp_dir = Path(USER_DIR) / "_restore_tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(io.BytesIO(uploaded_bytes), "r") as z:
+        z.extractall(tmp_dir)
+
+    # Validate structure
+    extracted_db = tmp_dir / "movies.db"
+    extracted_posters = tmp_dir / "posters"
+
+    if not extracted_db.exists():
+        shutil.rmtree(tmp_dir)
+        raise ValueError("Backup zip is missing movies.db")
+
+    # Replace db
+    shutil.copy2(extracted_db, DB_PATH)
+
+    # Replace posters folder
+    if os.path.exists(POSTERS_DIR):
+        shutil.rmtree(POSTERS_DIR)
+    os.makedirs(POSTERS_DIR, exist_ok=True)
+
+    if extracted_posters.exists():
+        shutil.copytree(extracted_posters, POSTERS_DIR, dirs_exist_ok=True)
+
+    shutil.rmtree(tmp_dir)
+
 # UI
 # ---------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -588,13 +657,31 @@ with tabs[2]:
                     st.rerun()
 
 # ---------------- Settings ----------------
+
 with tabs[3]:
     st.subheader("Settings")
     st.markdown("<p class='muted'>Everything is stored locally on this PC. No account, no cloud.</p>", unsafe_allow_html=True)
 
-    st.write("### Backup (manual)")
-    st.markdown("<p class='muted'>For crash testing: just copy these files somewhere safe.</p>", unsafe_allow_html=True)
-    st.code("movies.db\nposters/")
+  st.write("### Backup")
+
+backup_bytes = make_backup_zip_bytes()
+st.download_button(
+    "Export Backup (.zip)",
+    data=backup_bytes,
+    file_name="movie_shelf_backup.zip",
+    mime="application/zip",
+)
+
+st.write("### Restore")
+uploaded = st.file_uploader("Import Backup (.zip)", type=["zip"])
+if uploaded is not None:
+    try:
+        restore_from_backup_zip(uploaded.read())
+        st.success("Restored! Reloading…")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Could not restore backup: {e}")
+
 
     st.write("### OMDb (optional metadata)")
     if OMDB_API_KEY:
@@ -605,3 +692,4 @@ with tabs[3]:
             "<p class='muted'>If you want posters + auto info, get a free OMDb key and set OMDB_API_KEY.</p>",
             unsafe_allow_html=True,
         )
+
