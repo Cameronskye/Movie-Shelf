@@ -1,20 +1,24 @@
 # app.py
-# Movie Shelf — Local/Private + Optional OMDb + Go-UPC(UPCMDB) Barcode Add + Per-browser user isolation (no accounts)
+# Movie Shelf — Local/Private + Optional OMDb + UPCMDB Barcode Add + Per-browser user isolation (no accounts)
 #
 # Runs on localhost AND Streamlit Cloud.
 #
 # Features:
-# - Pure black UI
+# - Pure black UI (simple, consistent)
 # - Per-browser private library (anonymous user_id stored in browser localStorage)
-# - Local-first SQLite per user_id
+# - SQLite per user_id
 # - Posters cached locally (resized + compressed to keep storage low)
 # - Lists (create + add + reorder)
-# - Export/Import backup as a zip
-# - Add modes: Scan (UPC) / Quick (manual) / Search (OMDb)
+# - Export/Import backup (.zip)
+# - Clean Add menu with modes: Scan (UPCMDB) / Quick (manual) / Search (OMDb)
 #
-# Notes:
-# - On Streamlit Community Cloud, server disk can reset. Use Export Backup to keep data safe.
-# - UPC lookup uses Go-UPC documented endpoint: https://go-upc.com/api/v1/code/<code>?key=<api_key>
+# UPCMDB API (as provided by user):
+# Base: https://us-central1-upcmdb-cbae5.cloudfunctions.net/api
+# Header: x-api-key: YOUR_API_KEY
+# GET /v1/lookup/:upc
+# GET /v1/lookup/ean/:ean
+# GET /v1/lookup/imdb/:imdbId
+# GET /v1/search?title=...&year=...
 
 import os
 import io
@@ -25,7 +29,7 @@ import sqlite3
 import hashlib
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from io import BytesIO
 
 import requests
@@ -39,13 +43,20 @@ import zxingcpp
 
 from streamlit_local_storage import LocalStorage
 
+
 APP_TITLE = "Movie Shelf"
 
 # ---------------------------
 # Secrets / Env (works local + Streamlit Cloud)
 # ---------------------------
 OMDB_API_KEY = (st.secrets.get("OMDB_API_KEY", "") or os.getenv("OMDB_API_KEY", "")).strip()
+
+# UPCMDB key + base URL
 UPCMDB_API_KEY = (st.secrets.get("UPCMDB_API_KEY", "") or os.getenv("UPCMDB_API_KEY", "")).strip()
+UPCMDB_BASE_URL = (
+    st.secrets.get("UPCMDB_BASE_URL", "")
+    or os.getenv("UPCMDB_BASE_URL", "https://us-central1-upcmdb-cbae5.cloudfunctions.net/api")
+).rstrip("/")
 
 # ---------------------------
 # Per-browser user isolation (Option A)
@@ -163,49 +174,85 @@ def decode_barcode_from_image_bytes(img_bytes: bytes) -> Optional[str]:
     except Exception:
         return None
 
-# ---------------------------
-# UPC lookup (Go-UPC / UPCMDB-style)
-# ---------------------------
-def upcmdb_lookup(upc: str) -> Optional[dict]:
-    """
-    Lookup UPC/EAN via Go-UPC endpoint.
-    Returns normalized fields + raw response.
-    """
-    if not UPCMDB_API_KEY:
-        return None
+def normalize_code(code: str) -> str:
+    """Keep digits only; UPC/EAN are numeric."""
+    return "".join(ch for ch in (code or "") if ch.isdigit())
 
-    url = f"https://go-upc.com/api/v1/code/{upc}"
+# ---------------------------
+# UPCMDB API calls
+# ---------------------------
+def upcmdb_headers() -> Dict[str, str]:
+    return {"x-api-key": UPCMDB_API_KEY} if UPCMDB_API_KEY else {}
 
+def upcmdb_get_json(path: str, params: Optional[dict] = None) -> Dict[str, Any]:
+    url = f"{UPCMDB_BASE_URL}{path}"
+    r = requests.get(url, headers=upcmdb_headers(), params=params or {}, timeout=25)
+    if r.status_code != 200:
+        return {"_error": True, "status": r.status_code, "text": r.text[:500]}
     try:
-        # Preferred: key query parameter
-        r = requests.get(url, params={"key": UPCMDB_API_KEY, "format": "true"}, timeout=25)
+        return {"_error": False, "data": r.json()}
+    except Exception:
+        return {"_error": True, "status": r.status_code, "text": r.text[:500]}
 
-        # Some keys/plans might require Bearer auth
-        if r.status_code == 401:
-            r = requests.get(url, headers={"Authorization": f"Bearer {UPCMDB_API_KEY}"}, timeout=25)
+def upcmdb_lookup_code(code_digits: str) -> Dict[str, Any]:
+    """
+    If 12 digits -> UPC lookup
+    If 13 digits -> EAN lookup
+    """
+    if len(code_digits) == 12:
+        return upcmdb_get_json(f"/v1/lookup/{code_digits}")
+    if len(code_digits) == 13:
+        return upcmdb_get_json(f"/v1/lookup/ean/{code_digits}")
+    return {"_error": True, "status": 400, "text": f"Barcode must be 12 (UPC) or 13 (EAN) digits. Got {len(code_digits)}."}
 
-        if r.status_code != 200:
-            return {"error": f"{r.status_code}", "message": r.text[:250], "raw": None}
+def upcmdb_lookup_imdb(imdb_id: str) -> Dict[str, Any]:
+    return upcmdb_get_json(f"/v1/lookup/imdb/{imdb_id}")
 
-        data = r.json()
+def upcmdb_search(title: str, year: Optional[int] = None) -> Dict[str, Any]:
+    params = {"title": title}
+    if year:
+        params["year"] = str(year)
+    return upcmdb_get_json("/v1/search", params=params)
 
-        # Go-UPC commonly returns a dict containing "product"
-        title = None
-        year = None
-        imdb_id = None
+def extract_best_movie_fields(obj: Any) -> Dict[str, Any]:
+    """
+    UPCMDB returns normalized JSON; this function tries to pull common fields safely.
+    Since the exact response schema wasn’t pasted here, we do best-effort extraction
+    and fall back to showing raw JSON when needed.
+    """
+    title = None
+    year = None
+    imdb_id = None
+    poster = None
+    plot = None
 
-        if isinstance(data, dict):
-            product = data.get("product")
-            if isinstance(product, dict):
-                title = product.get("name") or product.get("title")
+    if isinstance(obj, dict):
+        # common-ish candidates
+        title = obj.get("title") or obj.get("name")
+        year = obj.get("year") or obj.get("releaseYear") or obj.get("release_year")
+        imdb_id = obj.get("imdbId") or obj.get("imdb_id") or obj.get("imdb")
+        poster = obj.get("poster") or obj.get("posterUrl") or obj.get("poster_url") or obj.get("image")
+        plot = obj.get("plot") or obj.get("description") or obj.get("synopsis")
 
-        # (General UPC databases may not provide IMDb IDs reliably—keep as best-effort.)
-        # If you find IMDb IDs in your UPCMDB response, we can wire parsing here later.
+        # nested candidates
+        for k in ["movie", "data", "record", "result", "item"]:
+            v = obj.get(k)
+            if isinstance(v, dict):
+                title = title or v.get("title") or v.get("name")
+                year = year or v.get("year") or v.get("releaseYear") or v.get("release_year")
+                imdb_id = imdb_id or v.get("imdbId") or v.get("imdb_id") or v.get("imdb")
+                poster = poster or v.get("poster") or v.get("posterUrl") or v.get("poster_url") or v.get("image")
+                plot = plot or v.get("plot") or v.get("description") or v.get("synopsis")
 
-        return {"title": title, "year": year, "imdb_id": imdb_id, "raw": data}
+    # year normalize
+    year_int = None
+    if year is not None:
+        try:
+            year_int = int(str(year)[:4])
+        except Exception:
+            year_int = None
 
-    except Exception as e:
-        return {"error": "exception", "message": str(e), "raw": None}
+    return {"title": title, "year": year_int, "imdb_id": imdb_id, "poster_url": poster, "plot": plot}
 
 # ---------------------------
 # OMDb fetch (optional)
@@ -413,7 +460,6 @@ def move_item(list_id: int, movie_id: int, direction: str):
 # Backup (Export/Import zip)
 # ---------------------------
 def make_backup_zip_bytes() -> bytes:
-    """Zip up the current user's movies.db + posters/ folder."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         db_file = Path(DB_PATH)
@@ -426,10 +472,10 @@ def make_backup_zip_bytes() -> bytes:
             for p in posters_dir.rglob("*"):
                 if p.is_file():
                     z.write(p, arcname=str(Path("posters") / p.relative_to(posters_dir)))
+
     return buf.getvalue()
 
 def restore_from_backup_zip(uploaded_bytes: bytes):
-    """Restore movies.db + posters/ from a zip uploaded by the user."""
     tmp_dir = Path(USER_DIR) / "_restore_tmp"
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
@@ -673,18 +719,18 @@ with tabs[1]:
 
 # ---------------- Add ----------------
 with tabs[2]:
-    st.subheader("Add Movie")
+    st.subheader("Add")
 
     mode = st.radio(
         "Add mode",
-        ["Scan (UPC)", "Quick (manual)", "Search (OMDb)"],
+        ["Scan (UPCMDB)", "Quick (manual)", "Search (OMDb)"],
         horizontal=True,
         key="add_mode",
         label_visibility="collapsed",
     )
 
-    if mode == "Scan (UPC)":
-        st.markdown("<p class='muted'>Take a clear photo of the barcode. The app will decode and add automatically.</p>", unsafe_allow_html=True)
+    if mode == "Scan (UPCMDB)":
+        st.markdown("<p class='muted'>Take a clear photo of the barcode. It will auto-add to your library.</p>", unsafe_allow_html=True)
 
         scan_fmt = st.selectbox("Format", ["DVD", "Blu-ray", "4K"], index=1, key="scan_fmt")
         scan_watched = st.checkbox("Watched", value=False, key="scan_watched")
@@ -695,55 +741,56 @@ with tabs[2]:
         shot = st.camera_input("Scan barcode", key="barcode_cam")
 
         if shot is not None:
-            upc = decode_barcode_from_image_bytes(shot.getvalue())
-            if not upc:
-                st.error("Couldn’t read a barcode from that image. Try more light, fill the frame, and avoid glare.")
+            raw_code = decode_barcode_from_image_bytes(shot.getvalue())
+            if not raw_code:
+                st.error("Couldn’t read a barcode. Try more light, fill the frame, and avoid glare.")
             else:
-                st.success(f"Scanned: {upc}")
+                code_digits = normalize_code(raw_code)
+                st.success(f"Scanned: {code_digits or raw_code}")
 
-                meta = upcmdb_lookup(upc)
-                if meta is None:
-                    st.error("UPCMDB lookup is unavailable (missing key).")
-                elif meta.get("error"):
-                    st.error(f"Lookup failed ({meta.get('error')}): {meta.get('message')}")
+                if not code_digits:
+                    st.error("Decoded barcode wasn’t numeric. (UPC/EAN should be digits.)")
                 else:
-                    # Best-effort title from UPC database
-                    title = meta.get("title")
-                    if not title:
-                        st.warning("Found a UPC record, but no title field was returned. Showing raw response:")
-                        st.json(meta.get("raw"))
+                    resp = upcmdb_lookup_code(code_digits)
+                    if resp.get("_error"):
+                        st.error(f"UPCMDB lookup failed ({resp.get('status')}): {resp.get('text')}")
                     else:
-                        # Optional: try OMDb search with the title to get poster/plot automatically
-                        poster_url = None
-                        plot = None
-                        year = None
+                        raw = resp.get("data")
+                        fields = extract_best_movie_fields(raw)
 
-                        # Try OMDb by searching the title (best-effort)
-                        if OMDB_API_KEY:
-                            results = omdb_search(title)
-                            if results:
-                                imdb_id = results[0][2]
-                                om = omdb_get(imdb_id)
-                                if om and om.title:
-                                    title = om.title
-                                    year = om.year
-                                    plot = om.plot
-                                    poster_url = om.poster_url
+                        # If UPCMDB gives an IMDb id, prefer OMDb for poster/plot consistency
+                        title = fields.get("title")
+                        year = fields.get("year")
+                        plot = fields.get("plot")
+                        poster_url = fields.get("poster_url")
+                        imdb_id = fields.get("imdb_id")
 
-                        add_movie(
-                            title=title,
-                            year=year,
-                            plot=plot,
-                            poster_url=poster_url,
-                            fmt=scan_fmt,
-                            watched=scan_watched,
-                            location=None,
-                            notes=f"Scanned UPC: {upc}",
-                            source="upc_scan",
-                            source_id=upc,
-                        )
-                        st.success(f"Added: {title}")
-                        st.rerun()
+                        if imdb_id and OMDB_API_KEY:
+                            om = omdb_get(imdb_id)
+                            if om and om.title:
+                                title = om.title
+                                year = om.year
+                                plot = om.plot
+                                poster_url = om.poster_url
+
+                        if not title:
+                            st.warning("UPCMDB returned a record, but I couldn’t find a title field. Showing raw JSON so we can map it:")
+                            st.json(raw)
+                        else:
+                            add_movie(
+                                title=title,
+                                year=year,
+                                plot=plot,
+                                poster_url=poster_url,
+                                fmt=scan_fmt,
+                                watched=scan_watched,
+                                location=None,
+                                notes=f"Scanned code: {code_digits}",
+                                source="upcmdb",
+                                source_id=code_digits,
+                            )
+                            st.success(f"Added: {title}")
+                            st.rerun()
 
     elif mode == "Quick (manual)":
         title = st.text_input("Title", key="add_title_manual")
@@ -767,6 +814,8 @@ with tabs[2]:
                     watched=watched,
                     location=location,
                     notes=notes,
+                    source="manual",
+                    source_id=None,
                 )
                 st.success("Added.")
                 st.rerun()
@@ -841,7 +890,7 @@ with tabs[3]:
 
     st.write("### API Keys")
     st.write(f"OMDb: {'✅ detected' if OMDB_API_KEY else '❌ missing'}")
-    st.write(f"UPCMDB (Go-UPC): {'✅ detected' if UPCMDB_API_KEY else '❌ missing'}")
+    st.write(f"UPCMDB: {'✅ detected' if UPCMDB_API_KEY else '❌ missing'}")
 
     st.write("### Privacy note")
     st.markdown(
