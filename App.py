@@ -1,36 +1,58 @@
+# app.py
+# Movie Shelf — Local/Private + Optional OMDb + Per-browser user isolation (no accounts)
+# Runs on localhost AND Streamlit Cloud.
+#
+# Key features:
+# - Pure black UI
+# - Local-first SQLite
+# - Posters cached locally (resized + compressed to keep storage low)
+# - Lists (create + add + reorder)
+# - Optional OMDb lookup (API key via st.secrets or env var)
+# - Option A isolation: anonymous per-browser user_id stored in browser localStorage
+# - Export/Import backup as a zip
+
 import os
+import io
+import uuid
+import shutil
+import zipfile
 import sqlite3
 import hashlib
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+from io import BytesIO
+
 import requests
 import streamlit as st
-
-APP_TITLE = "Movie Shelf"
-import uuid
-import os
-import streamlit as st
+from PIL import Image
 from streamlit_local_storage import LocalStorage
 
-# --- Secrets / env (works locally + Streamlit Cloud) ---
+APP_TITLE = "Movie Shelf"
+
+# ---------------------------
+# Secrets / Env
+# ---------------------------
+# Works both locally and on Streamlit Cloud.
 OMDB_API_KEY = (st.secrets.get("OMDB_API_KEY", "") or os.getenv("OMDB_API_KEY", "")).strip()
 
-# --- Anonymous per-browser user ID ---
+# ---------------------------
+# Per-browser user isolation (Option A)
+# ---------------------------
+# Each browser gets a random UUID stored in localStorage.
+# The app stores data in data/users/<user_id>/movies.db and posters/
 localS = LocalStorage()
 user_id = localS.getItem("movie_shelf_user_id")
 if not user_id:
     user_id = str(uuid.uuid4())
     localS.setItem("movie_shelf_user_id", user_id)
 
-# --- Force data to be stored per user ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USER_DIR = os.path.join(BASE_DIR, "data", "users", user_id)
 os.makedirs(USER_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(USER_DIR, "movies.db")
 POSTERS_DIR = os.path.join(USER_DIR, "posters")
-
-
 
 # ---------------------------
 # Database
@@ -81,22 +103,15 @@ def init_db():
             """
         )
 
-def touch_movie(movie_id: int):
-    with db() as conn:
-        conn.execute(
-            "UPDATE movies SET updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (movie_id,),
-        )
-
-
 # ---------------------------
-# Poster caching
+# Poster caching (semi-low quality)
 # ---------------------------
 def safe_filename(url: str) -> str:
     h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
     return f"{h}.jpg"
 
 def download_poster(url: str) -> Optional[str]:
+    """Downloads a poster, resizes it, and compresses it to keep storage low."""
     if not url or url.strip().lower() in {"n/a", "na", "none"}:
         return None
 
@@ -108,12 +123,23 @@ def download_poster(url: str) -> Optional[str]:
     try:
         r = requests.get(url, timeout=15)
         r.raise_for_status()
-        with open(path, "wb") as f:
-            f.write(r.content)
+
+        img = Image.open(BytesIO(r.content)).convert("RGB")
+
+        # Resize to keep storage low
+        target_width = 300  # try 400 if you want slightly sharper posters
+        if img.width > target_width:
+            ratio = target_width / float(img.width)
+            target_height = int(img.height * ratio)
+            img = img.resize((target_width, target_height), Image.LANCZOS)
+
+        # Compress JPEG
+        os.makedirs(POSTERS_DIR, exist_ok=True)
+        img.save(path, format="JPEG", quality=70, optimize=True)
+
         return path
     except Exception:
         return None
-
 
 # ---------------------------
 # OMDb fetch (optional)
@@ -173,7 +199,6 @@ def omdb_get(imdb_id: str) -> Optional[MovieMeta]:
         )
     except Exception:
         return None
-
 
 # ---------------------------
 # CRUD
@@ -235,23 +260,18 @@ def get_movies(q: str = "", sort: str = "title_asc") -> List[sqlite3.Row]:
 
 def get_movie(movie_id: int) -> Optional[sqlite3.Row]:
     with db() as conn:
-        row = conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
-        return row
+        return conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
 
 def update_movie(movie_id: int, **fields):
     if not fields:
         return
-    allowed = {
-        "title", "year", "plot", "format", "watched", "location", "notes",
-        "poster_url", "poster_path"
-    }
+    allowed = {"title", "year", "plot", "format", "watched", "location", "notes", "poster_url", "poster_path"}
     sets = []
     params = []
     for k, v in fields.items():
-        if k not in allowed:
-            continue
-        sets.append(f"{k}=?")
-        params.append(v)
+        if k in allowed:
+            sets.append(f"{k}=?")
+            params.append(v)
     if not sets:
         return
     params.append(movie_id)
@@ -326,13 +346,9 @@ def move_item(list_id: int, movie_id: int, direction: str):
             (a["position"], list_id, b["id"]),
         )
 
-
 # ---------------------------
-import io
-import zipfile
-import shutil
-from pathlib import Path
-
+# Backup (Export/Import zip)
+# ---------------------------
 def make_backup_zip_bytes() -> bytes:
     """Zip up the current user's movies.db + posters/ folder."""
     buf = io.BytesIO()
@@ -347,12 +363,10 @@ def make_backup_zip_bytes() -> bytes:
             for p in posters_dir.rglob("*"):
                 if p.is_file():
                     z.write(p, arcname=str(Path("posters") / p.relative_to(posters_dir)))
-
     return buf.getvalue()
 
 def restore_from_backup_zip(uploaded_bytes: bytes):
     """Restore movies.db + posters/ from a zip uploaded by the user."""
-    # Close any open DB connections by creating a fresh db() per call (your code already does).
     tmp_dir = Path(USER_DIR) / "_restore_tmp"
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
@@ -361,7 +375,6 @@ def restore_from_backup_zip(uploaded_bytes: bytes):
     with zipfile.ZipFile(io.BytesIO(uploaded_bytes), "r") as z:
         z.extractall(tmp_dir)
 
-    # Validate structure
     extracted_db = tmp_dir / "movies.db"
     extracted_posters = tmp_dir / "posters"
 
@@ -369,7 +382,8 @@ def restore_from_backup_zip(uploaded_bytes: bytes):
         shutil.rmtree(tmp_dir)
         raise ValueError("Backup zip is missing movies.db")
 
-    # Replace db
+    # Replace DB
+    os.makedirs(Path(DB_PATH).parent, exist_ok=True)
     shutil.copy2(extracted_db, DB_PATH)
 
     # Replace posters folder
@@ -382,7 +396,8 @@ def restore_from_backup_zip(uploaded_bytes: bytes):
 
     shutil.rmtree(tmp_dir)
 
-# UI
+# ---------------------------
+# UI setup
 # ---------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -397,20 +412,23 @@ st.markdown(
       .stApp { background-color: #000000; }
       header { background: rgba(0,0,0,0) !important; }
       div[data-testid="stSidebar"] { background-color: #000000; }
-      .stTextInput input, .stTextArea textarea, .stSelectbox div, .stButton button {
+      .stTextInput input, .stTextArea textarea, .stSelectbox div, .stButton button, .stRadio div {
         background-color: #000000 !important;
         color: #FFFFFF !important;
         border: 1px solid #333333 !important;
       }
-      .stButton button:hover {
-        border: 1px solid #666666 !important;
-      }
+      .stButton button:hover { border: 1px solid #666666 !important; }
       .muted { color: #BDBDBD; }
       .card {
         border: 1px solid #222;
         border-radius: 12px;
         padding: 10px;
         background: #000;
+      }
+      /* Make file uploader blend in */
+      section[data-testid="stFileUploader"] > div {
+        background-color: #000000 !important;
+        border: 1px solid #333333 !important;
       }
     </style>
     """,
@@ -420,15 +438,15 @@ st.markdown(
 init_db()
 
 st.title("🎬 Movie Shelf")
-st.caption("Local. Private. Simple. (Runs only on your machine.)")
+st.caption("Local. Private. Simple. (No account. Per-browser private library.)")
 
 tabs = st.tabs(["Library", "Lists", "Add", "Settings"])
 
 # ---------------- Library ----------------
 with tabs[0]:
-    colA, colB, colC = st.columns([3, 1, 1])
+    colA, colB = st.columns([4, 1])
     with colA:
-        q = st.text_input("Search", placeholder="Type a title…", label_visibility="collapsed")
+        q = st.text_input("Search", placeholder="Search titles…", label_visibility="collapsed", key="search_library")
     with colB:
         sort = st.selectbox(
             "Sort",
@@ -441,9 +459,8 @@ with tabs[0]:
             format_func=lambda x: x[0],
             index=0,
             label_visibility="collapsed",
+            key="sort_library",
         )[1]
-    with colC:
-        st.write("")  # spacer
 
     movies = get_movies(q=q, sort=sort)
 
@@ -458,13 +475,16 @@ with tabs[0]:
                     st.image(m["poster_path"], use_container_width=True)
                 else:
                     st.markdown('<p class="muted">No poster</p>', unsafe_allow_html=True)
+
                 title_line = m["title"]
                 if m["year"]:
                     title_line += f" ({m['year']})"
                 st.markdown(f"**{title_line}**")
-                st.markdown(f"<span class='muted'>{m['format']} · {'Watched' if m['watched'] else 'Unwatched'}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<span class='muted'>{m['format']} · {'Watched' if m['watched'] else 'Unwatched'}</span>",
+                    unsafe_allow_html=True,
+                )
 
-                # Quick actions
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("Open", key=f"open_{m['id']}"):
@@ -473,35 +493,63 @@ with tabs[0]:
                     if st.button("Delete", key=f"del_{m['id']}"):
                         delete_movie(m["id"])
                         st.rerun()
+
                 st.markdown("</div>", unsafe_allow_html=True)
 
-    # Movie detail modal-ish section
+    # Movie detail section (one at a time)
     movie_id = st.session_state.get("open_movie_id")
     if movie_id:
         m = get_movie(int(movie_id))
         if m:
             st.divider()
             st.subheader("Movie")
+
             left, right = st.columns([1, 2])
             with left:
                 if m["poster_path"] and os.path.exists(m["poster_path"]):
                     st.image(m["poster_path"], use_container_width=True)
                 else:
                     st.markdown('<p class="muted">No poster</p>', unsafe_allow_html=True)
+
             with right:
-                new_title = st.text_input("Title", value=m["title"])
-                new_year = st.number_input("Year", value=int(m["year"] or 0), min_value=0, max_value=3000)
-                new_plot = st.text_area("Description", value=m["plot"] or "", height=120)
-                new_fmt = st.selectbox("Format", ["DVD", "Blu-ray", "4K"], index=["DVD","Blu-ray","4K"].index(m["format"] if m["format"] in ["DVD","Blu-ray","4K"] else "Blu-ray"))
-                new_watched = st.checkbox("Watched", value=bool(m["watched"]))
-                new_location = st.text_input("Location (optional)", value=m["location"] or "")
-                new_notes = st.text_area("Notes (optional)", value=m["notes"] or "", height=100)
+                mid = int(m["id"])
+                new_title = st.text_input("Title", value=m["title"], key=f"detail_title_{mid}")
+                new_year = st.number_input(
+                    "Year",
+                    value=int(m["year"] or 0),
+                    min_value=0,
+                    max_value=3000,
+                    key=f"detail_year_{mid}",
+                )
+                new_plot = st.text_area("Description", value=m["plot"] or "", height=120, key=f"detail_plot_{mid}")
+
+                new_fmt = st.selectbox(
+                    "Format",
+                    ["DVD", "Blu-ray", "4K"],
+                    index=["DVD", "Blu-ray", "4K"].index(
+                        m["format"] if m["format"] in ["DVD", "Blu-ray", "4K"] else "Blu-ray"
+                    ),
+                    key=f"fmt_detail_{mid}",
+                )
+
+                new_watched = st.checkbox("Watched", value=bool(m["watched"]), key=f"detail_watched_{mid}")
+                new_location = st.text_input(
+                    "Location (optional)",
+                    value=m["location"] or "",
+                    key=f"detail_location_{mid}",
+                )
+                new_notes = st.text_area(
+                    "Notes (optional)",
+                    value=m["notes"] or "",
+                    height=100,
+                    key=f"detail_notes_{mid}",
+                )
 
                 c1, c2, c3 = st.columns([1, 1, 2])
                 with c1:
-                    if st.button("Save changes"):
+                    if st.button("Save changes", key=f"save_{mid}"):
                         update_movie(
-                            m["id"],
+                            mid,
                             title=new_title.strip(),
                             year=int(new_year) if new_year else None,
                             plot=new_plot.strip() or None,
@@ -512,17 +560,20 @@ with tabs[0]:
                         )
                         st.success("Saved.")
                 with c2:
-                    if st.button("Close"):
+                    if st.button("Close", key=f"close_{mid}"):
                         st.session_state["open_movie_id"] = None
                         st.rerun()
                 with c3:
-                    # Add to list quick
                     lists = get_lists()
                     if lists:
-                        list_choice = st.selectbox("Add to list", ["—"] + [l["name"] for l in lists])
-                        if list_choice != "—" and st.button("Add", key="addtolist_detail"):
+                        list_choice = st.selectbox(
+                            "Add to list",
+                            ["—"] + [l["name"] for l in lists],
+                            key=f"detail_addtolist_pick_{mid}",
+                        )
+                        if list_choice != "—" and st.button("Add", key=f"detail_addtolist_btn_{mid}"):
                             chosen = next(l for l in lists if l["name"] == list_choice)
-                            add_to_list(chosen["id"], m["id"])
+                            add_to_list(chosen["id"], mid)
                             st.success(f"Added to {list_choice}.")
         else:
             st.session_state["open_movie_id"] = None
@@ -530,12 +581,15 @@ with tabs[0]:
 # ---------------- Lists ----------------
 with tabs[1]:
     st.subheader("Lists")
-
     col1, col2 = st.columns([2, 3])
 
     with col1:
-        new_list_name = st.text_input("Create a new list", placeholder="e.g., Halloween")
-        if st.button("Create list"):
+        new_list_name = st.text_input(
+            "Create a new list",
+            placeholder="e.g., Halloween",
+            key="create_list_name",
+        )
+        if st.button("Create list", key="create_list_btn"):
             if new_list_name.strip():
                 try:
                     create_list(new_list_name.strip())
@@ -550,7 +604,7 @@ with tabs[1]:
             selected = None
         else:
             list_names = [l["name"] for l in lists]
-            selected_name = st.radio("Your lists", list_names, label_visibility="collapsed")
+            selected_name = st.radio("Your lists", list_names, label_visibility="collapsed", key="lists_radio")
             selected = next(l for l in lists if l["name"] == selected_name)
 
     with col2:
@@ -572,6 +626,7 @@ with tabs[1]:
                         if r["year"]:
                             t += f" ({r['year']})"
                         st.markdown(f"**{t}**  \n<span class='muted'>{r['format']}</span>", unsafe_allow_html=True)
+
                     with row[2]:
                         if st.button("↑", key=f"up_{selected['id']}_{r['id']}"):
                             move_item(selected["id"], r["id"], "up")
@@ -589,18 +644,18 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Add Movie")
 
-    mode = st.radio("Add mode", ["Quick (manual)", "Search (OMDb)"], horizontal=True)
+    mode = st.radio("Add mode", ["Quick (manual)", "Search (OMDb)"], horizontal=True, key="add_mode")
 
     if mode == "Quick (manual)":
-        title = st.text_input("Title")
-        year = st.number_input("Year (optional)", min_value=0, max_value=3000, value=0)
-        plot = st.text_area("Description (optional)", height=120)
-        fmt = st.selectbox("Format", ["DVD", "Blu-ray", "4K"], index=1)
-        watched = st.checkbox("Watched", value=False)
-        location = st.text_input("Location (optional)", placeholder="e.g., Living room shelf A")
-        notes = st.text_area("Notes (optional)", height=90)
+        title = st.text_input("Title", key="add_title_manual")
+        year = st.number_input("Year (optional)", min_value=0, max_value=3000, value=0, key="add_year_manual")
+        plot = st.text_area("Description (optional)", height=120, key="add_plot_manual")
+        fmt = st.selectbox("Format", ["DVD", "Blu-ray", "4K"], index=1, key="fmt_manual")
+        watched = st.checkbox("Watched", value=False, key="add_watched_manual")
+        location = st.text_input("Location (optional)", placeholder="e.g., Living room shelf A", key="add_loc_manual")
+        notes = st.text_area("Notes (optional)", height=90, key="add_notes_manual")
 
-        if st.button("Add to Library"):
+        if st.button("Add to Library", key="add_btn_manual"):
             if not title.strip():
                 st.warning("Please enter a title.")
             else:
@@ -614,20 +669,21 @@ with tabs[2]:
                     location=location,
                     notes=notes,
                 )
- st.success("Added.")
- st.rerun()
+                st.success("Added.")
+                st.rerun()
 
     else:
         if not OMDB_API_KEY:
-            st.warning("OMDb mode needs an API key. Set environment variable OMDB_API_KEY, then restart the app.")
-        query = st.text_input("Search title")
+            st.warning("OMDb mode needs an API key. Add OMDB_API_KEY in Streamlit Secrets (or env var) and restart.")
+        query = st.text_input("Search title", key="omdb_query")
         results = omdb_search(query) if query.strip() and OMDB_API_KEY else []
+
         if query.strip() and OMDB_API_KEY and not results:
             st.markdown('<p class="muted">No results.</p>', unsafe_allow_html=True)
 
         if results:
             labels = [f"{t} ({y})" for (t, y, _id) in results]
-            choice = st.selectbox("Matches", labels)
+            choice = st.selectbox("Matches", labels, key="omdb_choice")
             idx = labels.index(choice)
             imdb_id = results[idx][2]
 
@@ -636,7 +692,7 @@ with tabs[2]:
             location = st.text_input("Location (optional)", key="loc_omdb")
             notes = st.text_area("Notes (optional)", height=90, key="notes_omdb")
 
-            if st.button("Add to Library (with poster)"):
+            if st.button("Add to Library (with poster)", key="add_btn_omdb"):
                 meta = omdb_get(imdb_id)
                 if not meta or not meta.title:
                     st.error("Could not fetch details.")
@@ -657,31 +713,31 @@ with tabs[2]:
                     st.rerun()
 
 # ---------------- Settings ----------------
-
 with tabs[3]:
     st.subheader("Settings")
-    st.markdown("<p class='muted'>Everything is stored locally on this PC. No account, no cloud.</p>", unsafe_allow_html=True)
+    st.markdown("<p class='muted'>Per-browser private library. No account required.</p>", unsafe_allow_html=True)
 
-  st.write("### Backup")
+    st.write("### Backup")
+    backup_bytes = make_backup_zip_bytes()
+    st.download_button(
+        "Export Backup (.zip)",
+        data=backup_bytes,
+        file_name="movie_shelf_backup.zip",
+        mime="application/zip",
+        key="export_backup",
+    )
 
-backup_bytes = make_backup_zip_bytes()
-st.download_button(
-    "Export Backup (.zip)",
-    data=backup_bytes,
-    file_name="movie_shelf_backup.zip",
-    mime="application/zip",
-)
+    st.write("### Restore")
+    uploaded = st.file_uploader("Import Backup (.zip)", type=["zip"], key="import_uploader")
+    if uploaded is not None:
+        try:
+            restore_from_backup_zip(uploaded.read())
+            st.success("Restored! Reloading…")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not restore backup: {e}")
 
-st.write("### Restore")
-uploaded = st.file_uploader("Import Backup (.zip)", type=["zip"])
-if uploaded is not None:
-    try:
-        restore_from_backup_zip(uploaded.read())
-        st.success("Restored! Reloading…")
-        st.rerun()
-    except Exception as e:
-        st.error(f"Could not restore backup: {e}")
-
+    st.divider()
 
     st.write("### OMDb (optional metadata)")
     if OMDB_API_KEY:
@@ -689,8 +745,14 @@ if uploaded is not None:
     else:
         st.info("No OMDb key detected. Manual add still works.")
         st.markdown(
-            "<p class='muted'>If you want posters + auto info, get a free OMDb key and set OMDB_API_KEY.</p>",
+            "<p class='muted'>Tip: On Streamlit Cloud, add <b>OMDB_API_KEY</b> in app Secrets.</p>",
             unsafe_allow_html=True,
         )
+
+    st.write("### Privacy note")
+    st.markdown(
+        "<p class='muted'>On Streamlit Cloud, the server may reset. Use Export Backup to keep your library safe.</p>",
+        unsafe_allow_html=True,
+    )
 
 
