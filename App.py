@@ -614,8 +614,8 @@ with tabs[2]:
                     location=location,
                     notes=notes,
                 )
-                st.success("Added.")
-                st.rerun()
+ st.success("Added.")
+ st.rerun()
 
     else:
         if not OMDB_API_KEY:
@@ -692,4 +692,5 @@ if uploaded is not None:
             "<p class='muted'>If you want posters + auto info, get a free OMDb key and set OMDB_API_KEY.</p>",
             unsafe_allow_html=True,
         )
+
 
