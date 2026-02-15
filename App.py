@@ -1,15 +1,20 @@
 # app.py
-# Movie Shelf — Local/Private + Optional OMDb + Per-browser user isolation (no accounts)
+# Movie Shelf — Local/Private + Optional OMDb + UPCMDB Barcode Add + Per-browser user isolation (no accounts)
+#
 # Runs on localhost AND Streamlit Cloud.
 #
-# Key features:
+# Features:
 # - Pure black UI
-# - Local-first SQLite
+# - Per-browser private library (anonymous user_id stored in browser localStorage)
+# - Local-first SQLite per user_id
 # - Posters cached locally (resized + compressed to keep storage low)
 # - Lists (create + add + reorder)
-# - Optional OMDb lookup (API key via st.secrets or env var)
-# - Option A isolation: anonymous per-browser user_id stored in browser localStorage
 # - Export/Import backup as a zip
+# - Barcode “Scan & Add” (camera snapshot -> decode UPC/EAN -> UPCMDB -> OMDb -> auto-add)
+#
+# IMPORTANT:
+# - On Streamlit Community Cloud, server disk can reset. Use Export Backup to keep data safe.
+# - UPCMDB endpoint/auth may vary by plan/version. If lookup fails, we’ll adjust the endpoint list in upcmdb_lookup().
 
 import os
 import io
@@ -26,15 +31,26 @@ from io import BytesIO
 import requests
 import streamlit as st
 from PIL import Image
+
+# For barcode decode from camera snapshot
+import numpy as np
+import cv2
+import zxingcpp
+
 from streamlit_local_storage import LocalStorage
 
 APP_TITLE = "Movie Shelf"
 
 # ---------------------------
-# Secrets / Env
+# Secrets / Env (works local + Streamlit Cloud)
 # ---------------------------
-# Works both locally and on Streamlit Cloud.
 OMDB_API_KEY = (st.secrets.get("OMDB_API_KEY", "") or os.getenv("OMDB_API_KEY", "")).strip()
+
+UPCMDB_API_KEY = (st.secrets.get("UPCMDB_API_KEY", "") or os.getenv("UPCMDB_API_KEY", "")).strip()
+UPCMDB_BASE_URL = (
+    st.secrets.get("UPCMDB_BASE_URL", "")
+    or os.getenv("UPCMDB_BASE_URL", "https://upcmdb.com")
+).rstrip("/")
 
 # ---------------------------
 # Per-browser user isolation (Option A)
@@ -121,13 +137,13 @@ def download_poster(url: str) -> Optional[str]:
         return path
 
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
 
         img = Image.open(BytesIO(r.content)).convert("RGB")
 
         # Resize to keep storage low
-        target_width = 300  # try 400 if you want slightly sharper posters
+        target_width = 300  # bump to 400 if you want slightly sharper posters
         if img.width > target_width:
             ratio = target_width / float(img.width)
             target_height = int(img.height * ratio)
@@ -140,6 +156,107 @@ def download_poster(url: str) -> Optional[str]:
         return path
     except Exception:
         return None
+
+# ---------------------------
+# Barcode decode from camera snapshot
+# ---------------------------
+def decode_barcode_from_image_bytes(img_bytes: bytes) -> Optional[str]:
+    """
+    Uses zxing-cpp to decode UPC/EAN/etc from an image snapshot.
+    Returns the barcode text (digits) if found.
+    """
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        arr = np.array(img)
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+        res = zxingcpp.read_barcode(bgr)
+        if getattr(res, "valid", False) and getattr(res, "text", None):
+            return res.text.strip()
+        return None
+    except Exception:
+        return None
+
+# ---------------------------
+# UPCMDB lookup (endpoint may vary)
+# ---------------------------
+def upcmdb_lookup(upc: str) -> Optional[dict]:
+    """
+    Attempts to look up UPC via UPCMDB and return normalized fields.
+
+    Because UPCMDB endpoint/auth can vary, this tries a small list of likely endpoints.
+    If it fails, you can paste the error/status response and we’ll lock the correct path.
+    """
+    if not UPCMDB_API_KEY:
+        return None
+
+    # Try a few common API patterns; adjust if your UPCMDB docs specify something else.
+    candidate_paths = [
+        f"/api/v1/lookup/{upc}",
+        f"/api/v1/upc/{upc}",
+        f"/api/v1/code/{upc}",
+        f"/api/v1/{upc}",
+    ]
+
+    headers_bearer = {"Authorization": f"Bearer {UPCMDB_API_KEY}"}
+    params_key = {"key": UPCMDB_API_KEY}
+
+    last_err = None
+    for path in candidate_paths:
+        url = f"{UPCMDB_BASE_URL}{path}"
+        try:
+            # Try Bearer first
+            r = requests.get(url, headers=headers_bearer, timeout=25)
+            if r.status_code == 401:
+                # Try query-key only
+                r = requests.get(url, params=params_key, timeout=25)
+
+            if r.status_code != 200:
+                last_err = f"{r.status_code} {r.text[:200]}"
+                continue
+
+            data = r.json()
+
+            # Normalize likely shapes: title/year/imdb_id
+            title = None
+            year = None
+            imdb_id = None
+
+            if isinstance(data, dict):
+                title = data.get("title") or data.get("name")
+                imdb_id = data.get("imdb_id") or data.get("imdb") or data.get("imdbId")
+                y = data.get("year") or data.get("release_year")
+                if y:
+                    try:
+                        year = int(str(y)[:4])
+                    except Exception:
+                        year = None
+
+                # Some APIs nest payload
+                if not title and not imdb_id:
+                    for ck in ["data", "result", "item", "movie", "product"]:
+                        c = data.get(ck)
+                        if isinstance(c, dict):
+                            title = title or c.get("title") or c.get("name")
+                            imdb_id = imdb_id or c.get("imdb_id") or c.get("imdb") or c.get("imdbId")
+                            y2 = c.get("year") or c.get("release_year")
+                            if y2 and year is None:
+                                try:
+                                    year = int(str(y2)[:4])
+                                except Exception:
+                                    year = None
+
+            # If still nothing useful, return raw for debugging
+            if not title and not imdb_id:
+                return {"raw": data}
+
+            return {"title": title, "year": year, "imdb_id": imdb_id, "raw": data}
+
+        except Exception as e:
+            last_err = str(e)
+
+    st.warning(f"UPCMDB lookup failed for {upc}. Last error: {last_err}")
+    return None
 
 # ---------------------------
 # OMDb fetch (optional)
@@ -161,7 +278,7 @@ def omdb_search(title: str) -> List[Tuple[str, str, str]]:
         r = requests.get(
             "https://www.omdbapi.com/",
             params={"apikey": OMDB_API_KEY, "s": title},
-            timeout=15,
+            timeout=20,
         )
         data = r.json()
         if data.get("Response") != "True":
@@ -180,7 +297,7 @@ def omdb_get(imdb_id: str) -> Optional[MovieMeta]:
         r = requests.get(
             "https://www.omdbapi.com/",
             params={"apikey": OMDB_API_KEY, "i": imdb_id, "plot": "short"},
-            timeout=15,
+            timeout=20,
         )
         data = r.json()
         if data.get("Response") != "True":
@@ -255,8 +372,7 @@ def get_movies(q: str = "", sort: str = "title_asc") -> List[sqlite3.Row]:
         order = "ORDER BY title COLLATE NOCASE DESC"
 
     with db() as conn:
-        rows = conn.execute(f"SELECT * FROM movies {where} {order}", params).fetchall()
-        return rows
+        return conn.execute(f"SELECT * FROM movies {where} {order}", params).fetchall()
 
 def get_movie(movie_id: int) -> Optional[sqlite3.Row]:
     with db() as conn:
@@ -372,7 +488,7 @@ def restore_from_backup_zip(uploaded_bytes: bytes):
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(io.BytesIO(uploaded_bytes), "r") as z:
+    with zipfile.ZipFile(io.BytesIO(uploaded_bytes)), zipfile.ZipFile(io.BytesIO(uploaded_bytes), "r") as z:
         z.extractall(tmp_dir)
 
     extracted_db = tmp_dir / "movies.db"
@@ -412,7 +528,12 @@ st.markdown(
       .stApp { background-color: #000000; }
       header { background: rgba(0,0,0,0) !important; }
       div[data-testid="stSidebar"] { background-color: #000000; }
-      .stTextInput input, .stTextArea textarea, .stSelectbox div, .stButton button, .stRadio div {
+
+      .stTextInput input,
+      .stTextArea textarea,
+      .stSelectbox div,
+      .stButton button,
+      .stRadio div {
         background-color: #000000 !important;
         color: #FFFFFF !important;
         border: 1px solid #333333 !important;
@@ -425,7 +546,6 @@ st.markdown(
         padding: 10px;
         background: #000;
       }
-      /* Make file uploader blend in */
       section[data-testid="stFileUploader"] > div {
         background-color: #000000 !important;
         border: 1px solid #333333 !important;
@@ -496,7 +616,6 @@ with tabs[0]:
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
-    # Movie detail section (one at a time)
     movie_id = st.session_state.get("open_movie_id")
     if movie_id:
         m = get_movie(int(movie_id))
@@ -533,17 +652,8 @@ with tabs[0]:
                 )
 
                 new_watched = st.checkbox("Watched", value=bool(m["watched"]), key=f"detail_watched_{mid}")
-                new_location = st.text_input(
-                    "Location (optional)",
-                    value=m["location"] or "",
-                    key=f"detail_location_{mid}",
-                )
-                new_notes = st.text_area(
-                    "Notes (optional)",
-                    value=m["notes"] or "",
-                    height=100,
-                    key=f"detail_notes_{mid}",
-                )
+                new_location = st.text_input("Location (optional)", value=m["location"] or "", key=f"detail_location_{mid}")
+                new_notes = st.text_area("Notes (optional)", value=m["notes"] or "", height=100, key=f"detail_notes_{mid}")
 
                 c1, c2, c3 = st.columns([1, 1, 2])
                 with c1:
@@ -584,11 +694,7 @@ with tabs[1]:
     col1, col2 = st.columns([2, 3])
 
     with col1:
-        new_list_name = st.text_input(
-            "Create a new list",
-            placeholder="e.g., Halloween",
-            key="create_list_name",
-        )
+        new_list_name = st.text_input("Create a new list", placeholder="e.g., Halloween", key="create_list_name")
         if st.button("Create list", key="create_list_btn"):
             if new_list_name.strip():
                 try:
@@ -644,6 +750,69 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Add Movie")
 
+    # --- Scan & Add ---
+    st.write("### Scan & Add (Barcode)")
+    scan_fmt = st.selectbox("Format", ["DVD", "Blu-ray", "4K"], index=1, key="scan_fmt")
+    scan_watched = st.checkbox("Watched", value=False, key="scan_watched")
+
+    shot = st.camera_input("Point your camera at the barcode and take a clear photo", key="barcode_cam")
+
+    if shot is not None:
+        upc = decode_barcode_from_image_bytes(shot.getvalue())
+        if not upc:
+            st.error("Couldn’t read a barcode from that image. Try more light, fill the frame, and avoid glare.")
+        else:
+            st.success(f"Scanned: {upc}")
+
+            meta = upcmdb_lookup(upc)
+            if not meta:
+                st.error("UPCMDB didn’t return a match for that barcode (or the endpoint needs adjusting).")
+            else:
+                imdb_id = meta.get("imdb_id")
+                # Best path: UPCMDB -> IMDb ID -> OMDb for title/plot/poster
+                if imdb_id and OMDB_API_KEY:
+                    om = omdb_get(imdb_id)
+                    if om and om.title:
+                        add_movie(
+                            title=om.title,
+                            year=om.year,
+                            plot=om.plot,
+                            poster_url=om.poster_url,
+                            fmt=scan_fmt,
+                            watched=scan_watched,
+                            location=None,
+                            notes=f"Scanned UPC: {upc}",
+                            source="upcmdb+omdb",
+                            source_id=imdb_id,
+                        )
+                        st.success(f"Added: {om.title}")
+                        st.rerun()
+
+                # Fallback: use UPCMDB title if OMDb not available
+                title = meta.get("title")
+                year = meta.get("year")
+                if title:
+                    add_movie(
+                        title=title,
+                        year=year,
+                        plot=None,
+                        poster_url=None,
+                        fmt=scan_fmt,
+                        watched=scan_watched,
+                        location=None,
+                        notes=f"Scanned UPC: {upc}",
+                        source="upcmdb",
+                        source_id=meta.get("imdb_id"),
+                    )
+                    st.success(f"Added: {title}")
+                    st.rerun()
+
+                st.info("UPCMDB returned data, but it didn’t include a usable title/imdb_id. Here’s the raw response:")
+                st.json(meta.get("raw", meta))
+
+    st.divider()
+
+    # --- Manual / OMDb add ---
     mode = st.radio("Add mode", ["Quick (manual)", "Search (OMDb)"], horizontal=True, key="add_mode")
 
     if mode == "Quick (manual)":
@@ -739,20 +908,19 @@ with tabs[3]:
 
     st.divider()
 
-    st.write("### OMDb (optional metadata)")
+    st.write("### API Keys")
     if OMDB_API_KEY:
         st.success("OMDb API key detected.")
     else:
         st.info("No OMDb key detected. Manual add still works.")
-        st.markdown(
-            "<p class='muted'>Tip: On Streamlit Cloud, add <b>OMDB_API_KEY</b> in app Secrets.</p>",
-            unsafe_allow_html=True,
-        )
+
+    if UPCMDB_API_KEY:
+        st.success("UPCMDB API key detected.")
+    else:
+        st.info("No UPCMDB key detected. Barcode lookup won’t work without it.")
 
     st.write("### Privacy note")
     st.markdown(
         "<p class='muted'>On Streamlit Cloud, the server may reset. Use Export Backup to keep your library safe.</p>",
         unsafe_allow_html=True,
     )
-
-
