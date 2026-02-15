@@ -2,3 +2,6 @@ streamlit
 requests
 pillow
 streamlit-local-storage
+numpy
+opencv-python-headless
+zxing-cpp
