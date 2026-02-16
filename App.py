@@ -1,10 +1,8 @@
 # app.py
-# Movie Shelf — Local/Private + Optional OMDb + UPCMDB Barcode Add + Per-browser user isolation (no accounts)
-#
-# Runs on localhost AND Streamlit Cloud.
+# Movie Shelf — Local/Private + OMDb (optional) + UPCMDB barcode add + Per-browser user isolation (no accounts)
 #
 # Features:
-# - Pure black UI (simple, consistent)
+# - Pure black UI (consistent across pages)
 # - Per-browser private library (anonymous user_id stored in browser localStorage)
 # - SQLite per user_id
 # - Posters cached locally (resized + compressed to keep storage low)
@@ -12,13 +10,17 @@
 # - Export/Import backup (.zip)
 # - Clean Add menu with modes: Scan (UPCMDB) / Quick (manual) / Search (OMDb)
 #
-# UPCMDB API (as provided by user):
+# UPCMDB API (per your reference):
 # Base: https://us-central1-upcmdb-cbae5.cloudfunctions.net/api
-# Header: x-api-key: YOUR_API_KEY
+# Auth header: x-api-key: YOUR_API_KEY
 # GET /v1/lookup/:upc
 # GET /v1/lookup/ean/:ean
 # GET /v1/lookup/imdb/:imdbId
 # GET /v1/search?title=...&year=...
+#
+# 404 handling:
+# - If UPC lookup returns 404, it likely means "not in UPCMDB catalog"
+# - For EAN-13 codes starting with 0, we auto-fallback to UPC-12 by dropping the leading 0
 
 import os
 import io
@@ -43,7 +45,6 @@ import zxingcpp
 
 from streamlit_local_storage import LocalStorage
 
-
 APP_TITLE = "Movie Shelf"
 
 # ---------------------------
@@ -51,7 +52,6 @@ APP_TITLE = "Movie Shelf"
 # ---------------------------
 OMDB_API_KEY = (st.secrets.get("OMDB_API_KEY", "") or os.getenv("OMDB_API_KEY", "")).strip()
 
-# UPCMDB key + base URL
 UPCMDB_API_KEY = (st.secrets.get("UPCMDB_API_KEY", "") or os.getenv("UPCMDB_API_KEY", "")).strip()
 UPCMDB_BASE_URL = (
     st.secrets.get("UPCMDB_BASE_URL", "")
@@ -131,7 +131,7 @@ def safe_filename(url: str) -> str:
     return f"{h}.jpg"
 
 def download_poster(url: str) -> Optional[str]:
-    """Downloads a poster, resizes it, and compresses it to keep storage low."""
+    """Download poster, resize, compress."""
     if not url or url.strip().lower() in {"n/a", "na", "none"}:
         return None
 
@@ -143,10 +143,9 @@ def download_poster(url: str) -> Optional[str]:
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
-
         img = Image.open(BytesIO(r.content)).convert("RGB")
 
-        target_width = 300  # bump to 400 if you want slightly sharper posters
+        target_width = 300
         if img.width > target_width:
             ratio = target_width / float(img.width)
             target_height = int(img.height * ratio)
@@ -175,7 +174,7 @@ def decode_barcode_from_image_bytes(img_bytes: bytes) -> Optional[str]:
         return None
 
 def normalize_code(code: str) -> str:
-    """Keep digits only; UPC/EAN are numeric."""
+    """Keep digits only."""
     return "".join(ch for ch in (code or "") if ch.isdigit())
 
 # ---------------------------
@@ -186,9 +185,14 @@ def upcmdb_headers() -> Dict[str, str]:
 
 def upcmdb_get_json(path: str, params: Optional[dict] = None) -> Dict[str, Any]:
     url = f"{UPCMDB_BASE_URL}{path}"
-    r = requests.get(url, headers=upcmdb_headers(), params=params or {}, timeout=25)
+    try:
+        r = requests.get(url, headers=upcmdb_headers(), params=params or {}, timeout=25)
+    except Exception as e:
+        return {"_error": True, "status": "exception", "text": str(e)}
+
     if r.status_code != 200:
         return {"_error": True, "status": r.status_code, "text": r.text[:500]}
+
     try:
         return {"_error": False, "data": r.json()}
     except Exception:
@@ -198,12 +202,25 @@ def upcmdb_lookup_code(code_digits: str) -> Dict[str, Any]:
     """
     If 12 digits -> UPC lookup
     If 13 digits -> EAN lookup
+    If EAN returns 404 and starts with 0 -> try UPC-12 fallback (drop leading 0)
     """
     if len(code_digits) == 12:
         return upcmdb_get_json(f"/v1/lookup/{code_digits}")
+
     if len(code_digits) == 13:
-        return upcmdb_get_json(f"/v1/lookup/ean/{code_digits}")
-    return {"_error": True, "status": 400, "text": f"Barcode must be 12 (UPC) or 13 (EAN) digits. Got {len(code_digits)}."}
+        ean_resp = upcmdb_get_json(f"/v1/lookup/ean/{code_digits}")
+
+        if ean_resp.get("_error") and ean_resp.get("status") == 404 and code_digits.startswith("0"):
+            upc12 = code_digits[1:]
+            return upcmdb_get_json(f"/v1/lookup/{upc12}")
+
+        return ean_resp
+
+    return {
+        "_error": True,
+        "status": 400,
+        "text": f"Barcode must be 12 (UPC) or 13 (EAN) digits. Got {len(code_digits)}.",
+    }
 
 def upcmdb_lookup_imdb(imdb_id: str) -> Dict[str, Any]:
     return upcmdb_get_json(f"/v1/lookup/imdb/{imdb_id}")
@@ -216,9 +233,8 @@ def upcmdb_search(title: str, year: Optional[int] = None) -> Dict[str, Any]:
 
 def extract_best_movie_fields(obj: Any) -> Dict[str, Any]:
     """
-    UPCMDB returns normalized JSON; this function tries to pull common fields safely.
-    Since the exact response schema wasn’t pasted here, we do best-effort extraction
-    and fall back to showing raw JSON when needed.
+    Best-effort extraction from UPCMDB JSON (schema-safe).
+    If the schema differs, raw JSON is still available.
     """
     title = None
     year = None
@@ -227,14 +243,12 @@ def extract_best_movie_fields(obj: Any) -> Dict[str, Any]:
     plot = None
 
     if isinstance(obj, dict):
-        # common-ish candidates
         title = obj.get("title") or obj.get("name")
         year = obj.get("year") or obj.get("releaseYear") or obj.get("release_year")
         imdb_id = obj.get("imdbId") or obj.get("imdb_id") or obj.get("imdb")
         poster = obj.get("poster") or obj.get("posterUrl") or obj.get("poster_url") or obj.get("image")
         plot = obj.get("plot") or obj.get("description") or obj.get("synopsis")
 
-        # nested candidates
         for k in ["movie", "data", "record", "result", "item"]:
             v = obj.get(k)
             if isinstance(v, dict):
@@ -244,7 +258,6 @@ def extract_best_movie_fields(obj: Any) -> Dict[str, Any]:
                 poster = poster or v.get("poster") or v.get("posterUrl") or v.get("poster_url") or v.get("image")
                 plot = plot or v.get("plot") or v.get("description") or v.get("synopsis")
 
-    # year normalize
     year_int = None
     if year is not None:
         try:
@@ -255,7 +268,7 @@ def extract_best_movie_fields(obj: Any) -> Dict[str, Any]:
     return {"title": title, "year": year_int, "imdb_id": imdb_id, "poster_url": poster, "plot": plot}
 
 # ---------------------------
-# OMDb fetch (optional)
+# OMDb (optional)
 # ---------------------------
 @dataclass
 class MovieMeta:
@@ -267,7 +280,6 @@ class MovieMeta:
     source_id: Optional[str] = None
 
 def omdb_search(title: str) -> List[Tuple[str, str, str]]:
-    """Returns list of (Title, Year, imdbID)"""
     if not OMDB_API_KEY:
         return []
     try:
@@ -618,15 +630,24 @@ with tabs[0]:
             with right:
                 mid = int(m["id"])
                 new_title = st.text_input("Title", value=m["title"], key=f"detail_title_{mid}")
-                new_year = st.number_input("Year", value=int(m["year"] or 0), min_value=0, max_value=3000, key=f"detail_year_{mid}")
+                new_year = st.number_input(
+                    "Year",
+                    value=int(m["year"] or 0),
+                    min_value=0,
+                    max_value=3000,
+                    key=f"detail_year_{mid}",
+                )
                 new_plot = st.text_area("Description", value=m["plot"] or "", height=120, key=f"detail_plot_{mid}")
 
                 new_fmt = st.selectbox(
                     "Format",
                     ["DVD", "Blu-ray", "4K"],
-                    index=["DVD", "Blu-ray", "4K"].index(m["format"] if m["format"] in ["DVD", "Blu-ray", "4K"] else "Blu-ray"),
+                    index=["DVD", "Blu-ray", "4K"].index(
+                        m["format"] if m["format"] in ["DVD", "Blu-ray", "4K"] else "Blu-ray"
+                    ),
                     key=f"fmt_detail_{mid}",
                 )
+
                 new_watched = st.checkbox("Watched", value=bool(m["watched"]), key=f"detail_watched_{mid}")
                 new_location = st.text_input("Location (optional)", value=m["location"] or "", key=f"detail_location_{mid}")
                 new_notes = st.text_area("Notes (optional)", value=m["notes"] or "", height=100, key=f"detail_notes_{mid}")
@@ -650,11 +671,15 @@ with tabs[0]:
                         st.session_state["open_movie_id"] = None
                         st.rerun()
                 with c3:
-                    lists = get_lists()
-                    if lists:
-                        list_choice = st.selectbox("Add to list", ["—"] + [l["name"] for l in lists], key=f"detail_addtolist_pick_{mid}")
+                    lists_ = get_lists()
+                    if lists_:
+                        list_choice = st.selectbox(
+                            "Add to list",
+                            ["—"] + [l["name"] for l in lists_],
+                            key=f"detail_addtolist_pick_{mid}",
+                        )
                         if list_choice != "—" and st.button("Add", key=f"detail_addtolist_btn_{mid}"):
-                            chosen = next(l for l in lists if l["name"] == list_choice)
+                            chosen = next(l for l in lists_ if l["name"] == list_choice)
                             add_to_list(chosen["id"], mid)
                             st.success(f"Added to {list_choice}.")
         else:
@@ -676,14 +701,14 @@ with tabs[1]:
                 except sqlite3.IntegrityError:
                     st.warning("That list already exists.")
 
-        lists = get_lists()
-        if not lists:
+        lists_ = get_lists()
+        if not lists_:
             st.markdown('<p class="muted">No lists yet.</p>', unsafe_allow_html=True)
             selected = None
         else:
-            list_names = [l["name"] for l in lists]
+            list_names = [l["name"] for l in lists_]
             selected_name = st.radio("Your lists", list_names, label_visibility="collapsed", key="lists_radio")
-            selected = next(l for l in lists if l["name"] == selected_name)
+            selected = next(l for l in lists_ if l["name"] == selected_name)
 
     with col2:
         if selected:
@@ -736,7 +761,7 @@ with tabs[2]:
         scan_watched = st.checkbox("Watched", value=False, key="scan_watched")
 
         if not UPCMDB_API_KEY:
-            st.warning("Missing UPCMDB_API_KEY. Add it in Streamlit Secrets (or env var) to use barcode lookup.")
+            st.warning("Missing UPCMDB_API_KEY. Add it in Streamlit Secrets (or env var) to use UPCMDB lookups.")
 
         shot = st.camera_input("Scan barcode", key="barcode_cam")
 
@@ -753,18 +778,22 @@ with tabs[2]:
                 else:
                     resp = upcmdb_lookup_code(code_digits)
                     if resp.get("_error"):
-                        st.error(f"UPCMDB lookup failed ({resp.get('status')}): {resp.get('text')}")
+                        status = resp.get("status")
+                        if status == 404:
+                            st.warning("Not found in UPCMDB’s verified catalog for this code. Try OMDb search or manual add.")
+                        else:
+                            st.error(f"UPCMDB lookup failed ({status}): {resp.get('text')}")
                     else:
                         raw = resp.get("data")
                         fields = extract_best_movie_fields(raw)
 
-                        # If UPCMDB gives an IMDb id, prefer OMDb for poster/plot consistency
                         title = fields.get("title")
                         year = fields.get("year")
                         plot = fields.get("plot")
                         poster_url = fields.get("poster_url")
                         imdb_id = fields.get("imdb_id")
 
+                        # If UPCMDB provides IMDb ID, prefer OMDb details (optional)
                         if imdb_id and OMDB_API_KEY:
                             om = omdb_get(imdb_id)
                             if om and om.title:
